@@ -471,6 +471,13 @@ export function apply(ctx, config) {
         checkInState = { at: Date.now(), ok: false, note: creditsCache.note, text: '' }
         return { ok: false, reason: checkInState.note }
       }
+      // 站点已经记录今天领过：直接判定成功，不再发 POST。
+      // 否则网络一抖动就会把「已签到」覆盖成 fetch failed，设置页看着像失败。
+      if (before && before.claimedToday) {
+        await writeConfig({ lastCheckInDate: today }).catch(() => {})
+        checkInState = { at: Date.now(), ok: true, note: '今天已经领过了', text: '' }
+        return { ok: true, note: checkInState.note, date: today, credits: before, balance: before.balance }
+      }
       const claim = await siteFetch('/api/credits/daily-claim', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -596,10 +603,11 @@ export function apply(ctx, config) {
             }
             const credits = await refreshCredits(false)
             const today = localDate()
+            // 今天已经签过就是成功：即使上一次 POST 因网络抖动失败，也不该显示成失败。
             const stateOut =
-              checkInState.at || !c.lastCheckInDate || c.lastCheckInDate !== today
-                ? checkInState
-                : { at: null, ok: true, note: '今天已经签过了', text: '' }
+              c.lastCheckInDate === today
+                ? { at: checkInState.at, ok: true, note: '今天已经签过了', text: checkInState.text }
+                : checkInState
             sendJson(res, 200, {
               cookie: { configured: true },
               autoCheckIn: c.autoCheckIn,
