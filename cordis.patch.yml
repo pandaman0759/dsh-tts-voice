@@ -1,0 +1,9 @@
+- insert:
+    - id: dsh-tts-voice
+      name: '@local/dsh-tts-voice'
+      config:
+        enabled: true
+        maxChars: 20
+        voiceId: 'voc_8yud7hz7c9q2'
+        modelId: 'breeze-tts-2-multilingual'
+        languageCode: 'zh'

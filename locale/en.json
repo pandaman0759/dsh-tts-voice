@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Reply voice",
+    "description": "Speaks a short summary of each finished reply with Breeze TTS. Playback only — no audio file is stored."
+  }
+}
