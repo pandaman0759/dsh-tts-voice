@@ -22,12 +22,45 @@ const QUEUE_MAX = 12
 export const inject = ['tools', 'webServer']
 
 export function apply(ctx, config) {
+  const dbg = async (line) => {
+    if (process.env.DSH_TTS_DEBUG !== '1') return
+    try {
+      const fs = await import('node:fs/promises')
+      const os = await import('node:os')
+      const path = await import('node:path')
+      const file = path.join(os.tmpdir(), 'dsh-tts-voice-debug.log')
+      await fs.appendFile(file, `${new Date().toISOString()} ${line}\n`, 'utf8')
+    } catch {
+      /* ignore */
+    }
+  }
+
   const queue = []
   /** 最近一次播放回执，只用于自检（设置页/命令行都看不到音频本体）。 */
   let lastOutcome = null
   let log = () => {}
   try {
-    log = typeof ctx.logger === 'function' ? ctx.logger('dsh-tts-voice') : () => {}
+    // 宿主不同版本的 ctx.logger 有时返回函数、有时返回 {info,warn,error} 对象，
+    // 之前直接把返回值当函数调，合成失败路径上抛 TypeError 把真正的错误盖掉。
+    const raw = typeof ctx.logger === 'function' ? ctx.logger('dsh-tts-voice') : null
+    if (typeof raw === 'function') {
+      log = (level, message) => {
+        try {
+          raw(level, message)
+        } catch {
+          /* ignore */
+        }
+      }
+    } else if (raw && typeof raw === 'object') {
+      log = (level, message) => {
+        try {
+          const fn = raw[level] || raw.log || raw.info
+          if (typeof fn === 'function') fn.call(raw, message)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   } catch {
     log = () => {}
   }
@@ -159,10 +192,23 @@ export function apply(ctx, config) {
 
   function enqueue(text, instructions) {
     sweep()
+    const direction = typeof instructions === 'string' ? instructions.trim().slice(0, 1000) : ''
+    // 一秒内连续两句（比如工具补救又补一句）直接并成一句，免得前一句刚播完
+    // 后一句紧接着又响，听感像被打断；已经取走（claimedAt）的条目不动。
+    const last = queue[queue.length - 1]
+    if (last && !last.claimedAt && !last.audio && Date.now() - last.createdAt < 1200) {
+      const merged = `${last.text}${/[。！？!?…,，]$/.test(last.text) ? '' : '，'}${text}`
+      if (merged.length <= MAX_REQUEST_CHARS) {
+        last.text = merged
+        last.createdAt = Date.now()
+        if (direction) last.instructions = direction
+        return last
+      }
+    }
     const item = {
       id: (globalThis.crypto?.randomUUID?.() ?? `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`),
       text,
-      instructions: typeof instructions === 'string' ? instructions.trim().slice(0, 1000) : '',
+      instructions: direction,
       createdAt: Date.now(),
       claimedAt: 0,
       audio: null,
@@ -185,23 +231,42 @@ export function apply(ctx, config) {
       voice_settings: { speed: c.speed, volume: c.volume, guidance_scale: 2 },
     }
     if (direction) payload.instructions = direction
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': key,
-        'content-type': 'application/json',
-        accept: 'audio/mpeg',
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(30_000),
-    })
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '')
-      throw new Error(`Breeze ${response.status}：${detail.slice(0, 300)}`)
+    // 合成失败重试一次：短时间内连着两句话时 Breeze 偶尔会限流或超时，
+    // 以前直接判失败、页面那一条就彻底没声了。
+    let lastError = null
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'xi-api-key': key,
+            'content-type': 'application/json',
+            accept: 'audio/mpeg',
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(90_000),
+        })
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          const error = new Error(`Breeze ${response.status}：${detail.slice(0, 300)}`)
+          error.status = response.status
+          throw error
+        }
+        const buffer = Buffer.from(await response.arrayBuffer())
+        if (buffer.length === 0) throw new Error('Breeze 返回了空音频')
+        return { buffer, contentType: response.headers.get('content-type') || 'audio/mpeg' }
+      } catch (error) {
+        lastError = error
+        const status = error && typeof error.status === 'number' ? error.status : 0
+        // 明确的客户端错误（key 不对、参数不合法）重试也没用，直接放弃。
+        if (status === 400 || status === 401 || status === 403 || status === 404) break
+        // 超时说明 Breeze 正在排队（连续多次合成后会明显变慢），再等一轮只会更久，直接放弃。
+        if (/abort|timeout/i.test(String(error && error.message ? error.message : error))) break
+        log('warn', `合成第 ${attempt + 1} 次失败：${String(error && error.message ? error.message : error)}`)
+        await new Promise((resolve) => setTimeout(resolve, 700))
+      }
     }
-    const buffer = Buffer.from(await response.arrayBuffer())
-    if (buffer.length === 0) throw new Error('Breeze 返回了空音频')
-    return { buffer, contentType: response.headers.get('content-type') || 'audio/mpeg' }
+    throw lastError || new Error('合成失败')
   }
 
   // ---------------------------------------------------------------- tool
@@ -218,7 +283,8 @@ export function apply(ctx, config) {
             + '中文里可以用方括号音频标签替代语气词，例如 [轻笑] [咯咯笑] [叹气] [耳语] [停顿] [咂嘴] [哼歌] [冷笑] [闷哼] [咳嗽] [打哈欠]；'
             + '中文文本只能用方括号标签，不要混用英文圆括号写法（如（笑）会被当普通文字读出来）。'
             + '需要临时改变这一句的语气时，用 instructions 传一句中文表演指令（如「小声嘀咕，有点不服气」）。'
-            + '纯闲聊、一问一答之前不需要调用；本轮没有说话可说时也不要调用。',
+            + '这是每一轮的结束提示音：不论这轮是干活、闲聊、报错还是只回一句「在的」，在最终回复输出之前都必须调用一次，不能省略。'
+            + '这一轮没有实质结论时，就播一句简短的收尾（例如「[轻笑] 在的，你说。」「[停顿] 那就先这样。」），仍然要调用。',
           parameters: {
             type: 'object',
             properties: {
@@ -276,6 +342,31 @@ export function apply(ctx, config) {
       ),
     )
   }
+
+  // 语音规则常驻系统提示：只写在工具描述里模型会漏（新窗口开场最容易漏），
+  // 所以照 dsh-meme 的做法，在 system-prompt/assemble 里追加一段固定规则。
+  const VOICE_RULE =
+    '语音播报规则：每轮回复结束前都要调用一次 voice_say，把这一轮的结论压成一句话念出来（相当于结束提示音）。'
+    + '不论这一轮是干活、闲聊、报错，还是只回一句「在的」，在最终回复输出之前都必须调用一次，不能省略；'
+    + '没有实质结论时就播一句简短收尾，例如「[轻笑] 在的，你说。」「[停顿] 那就先这样。」。'
+    + '设置页里的字数上限是给模型写总结的要求，不是播报的截断线——超了照样整句播，只在结果里提示超了几字，所以请自己压到上限以内再调用。'
+    + '中文文本可以用方括号音频标签，如 [轻笑] [叹气] [停顿] [耳语]。'
+
+  ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembled = await next()
+    try {
+      const c = settings()
+      if (!c.enabled) return assembled
+      if (assembled && Array.isArray(assembled.sections)) {
+        assembled.sections.push({ name: 'dsh-tts-voice:rule', text: VOICE_RULE })
+      } else {
+        log('warn', 'system-prompt: sections 不是数组，语音规则没注入')
+      }
+    } catch (error) {
+      log('warn', `system-prompt 注入失败：${String(error && error.message ? error.message : error)}`)
+    }
+    return assembled
+  })
 
   // ------------------------------------------------------- daily credits
   //
@@ -545,15 +636,25 @@ export function apply(ctx, config) {
           kind: 'exact',
           path: `${PREFIX}/audio`,
           handler: async (req, res) => {
-            const url = new URL(req.url || PREFIX, 'http://127.0.0.1')
-            const id = url.searchParams.get('id') || ''
-            const item = queue.find((entry) => entry.id === id)
-            if (!item) return sendJson(res, 404, { error: '这条语音已经不在了' })
+            void dbg(`audio enter ${req.method} ${req.url}`)
             try {
+              const url = new URL(req.url || PREFIX, 'http://127.0.0.1')
+              const id = url.searchParams.get('id') || ''
+              const item = queue.find((entry) => entry.id === id)
+              if (!item) return sendJson(res, 404, { error: '这条语音已经不在了' })
+              if (item.audio) void dbg(`audio cache-hit ${id} ${item.audio.length}`)
               if (!item.audio) {
-                const { buffer, contentType } = await synthesize(item.text, item.instructions)
+                // 同一句被多个页面同时索要时共用一次合成，避免并发打到 Breeze 再各自失败
+                if (!item.synth) {
+                  item.synth = synthesize(item.text, item.instructions)
+                  item.synth.catch(() => {
+                    item.synth = null
+                  })
+                }
+                const { buffer, contentType } = await item.synth
                 item.audio = buffer
                 item.contentType = contentType
+                void dbg(`audio synthesized ${id} ${buffer.length}`)
               }
               res.writeHead(200, {
                 'content-type': item.contentType,
@@ -563,7 +664,17 @@ export function apply(ctx, config) {
               res.end(item.audio)
             } catch (error) {
               const message = String(error && error.message ? error.message : error)
+              void dbg(`audio error ${message} | stack=${(error && error.stack ? error.stack : '').split('\n').slice(0, 4).join(' / ')}`)
               log('warn', `合成失败：${message}`)
+              // 响应已经开始写（客户端断开、流已结束）时不能再写头，否则框架会把二次写入转成 400 空响应
+              if (res.headersSent || res.writableEnded) {
+                try {
+                  res.end()
+                } catch {
+                  /* ignore */
+                }
+                return
+              }
               if (/未配置/.test(message)) return sendJson(res, 400, { error: message })
               if (/401|403/.test(message)) return sendJson(res, 502, { error: message })
               sendJson(res, 502, { error: message })

@@ -66,15 +66,36 @@ window.__ModuleLoader__.load({
       heroMeta: { fontSize: '12px', opacity: 0.66 },
     }
 
-    async function playBlob(blobUrl) {
+    async function playOnce(blobUrl) {
       const audio = new Audio(blobUrl)
       audio.volume = 1
-      await new Promise((resolve, reject) => {
-        audio.onended = () => resolve()
-        audio.onerror = () => reject(new Error('音频播放失败'))
-        const started = audio.play()
-        if (started && typeof started.then === 'function') started.catch(reject)
-      })
+      audio.preload = 'auto'
+      try {
+        await new Promise((resolve, reject) => {
+          audio.onended = () => resolve()
+          audio.onerror = () => reject(new Error('音频播放失败'))
+          const started = audio.play()
+          if (started && typeof started.then === 'function') started.catch(reject)
+        })
+      } finally {
+        try {
+          audio.pause()
+        } catch {
+          // 忽略：元素可能已经被回收
+        }
+        audio.src = ''
+      }
+    }
+
+    // 浏览器在后台标签里偶尔会拒绝第一次 play()（自动播放策略），
+    // 换一个全新的 Audio 实例再试一次，比直接丢掉这一条更划算。
+    async function playBlob(blobUrl) {
+      try {
+        await playOnce(blobUrl)
+      } catch (error) {
+        await new Promise((resolve) => setTimeout(resolve, 350))
+        await playOnce(blobUrl)
+      }
     }
 
     function startPlayer(ctx) {
@@ -89,10 +110,17 @@ window.__ModuleLoader__.load({
         timer = window.setTimeout(tick, delay)
       }
 
+      // 页面切到后台也要继续取队列：以前 hidden 直接跳过，结果人一离开窗口
+      // 音频就堆在内存里等到过期（120 秒），回来时早就没了——「调用了但没声音」。
+      const pollDelay = () =>
+        typeof document !== 'undefined' && document.visibilityState === 'hidden'
+          ? Math.max(POLL_MS, 2500)
+          : POLL_MS
+
       const tick = async () => {
         if (stopped) return
-        if (busy || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) {
-          schedule(POLL_MS)
+        if (busy) {
+          schedule(pollDelay())
           return
         }
         busy = true
@@ -142,7 +170,7 @@ window.__ModuleLoader__.load({
           busy = false
           if (seen.size > 64) seen.clear()
         }
-        schedule(POLL_MS)
+        schedule(pollDelay())
       }
 
       const onVisibility = () => {
