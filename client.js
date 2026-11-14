@@ -87,9 +87,20 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // 播 TTS 之前先响一声提示音（插件内嵌的 /chime，1 秒）。
+    // 提示音出问题不影响正片：吞掉异常直接往下走。
+    async function playChime() {
+      try {
+        await playOnce(`${PREFIX}/chime`)
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 120))
+      }
+    }
+
     // 浏览器在后台标签里偶尔会拒绝第一次 play()（自动播放策略），
     // 换一个全新的 Audio 实例再试一次，比直接丢掉这一条更划算。
     async function playBlob(blobUrl) {
+      await playChime()
       try {
         await playOnce(blobUrl)
       } catch (error) {
@@ -214,6 +225,7 @@ window.__ModuleLoader__.load({
       const [volume, setVolume] = React.useState('0.9')
       const [audioTags, setAudioTags] = React.useState(true)
       const [autoCheckIn, setAutoCheckIn] = React.useState(true)
+      const [checkInAt, setCheckInAt] = React.useState('08:01')
       const [siteCookieInput, setSiteCookieInput] = React.useState('')
       const [siteCookieState, setSiteCookieState] = React.useState({ configured: false })
       const [creditState, setCreditState] = React.useState({ lastCheckInDate: '', state: null })
@@ -237,6 +249,7 @@ window.__ModuleLoader__.load({
         setVolume(String(data.volume ?? 0.9))
         setAudioTags(data.audioTags !== false)
         setAutoCheckIn(data.autoCheckIn !== false)
+        setCheckInAt(data.checkInAt || '08:01')
         if (data.siteCookie) setSiteCookieState(data.siteCookie)
         setCreditState((prev) => ({ ...prev, lastCheckInDate: data.lastCheckInDate || '' }))
         setKeyState(data.key || { configured: false, masked: '', source: 'none' })
@@ -274,6 +287,7 @@ window.__ModuleLoader__.load({
             volume: Number(volume),
             audioTags,
             autoCheckIn,
+            checkInAt,
           }
           if (keyInput.trim()) body.apiKey = keyInput.trim()
           if (siteCookieInput.trim()) body.siteCookie = siteCookieInput.trim()
@@ -293,7 +307,7 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy(false)
         }
-      }, [applyState, enabled, keyInput, siteCookieInput, autoCheckIn, maxChars, voiceId, instructions, speed, volume, audioTags])
+      }, [applyState, enabled, keyInput, siteCookieInput, autoCheckIn, checkInAt, maxChars, voiceId, instructions, speed, volume, audioTags])
 
       const clearKey = React.useCallback(async () => {
         setBusy(true)
@@ -648,7 +662,7 @@ window.__ModuleLoader__.load({
           h(
             'p',
             { style: css.hint },
-            '每天打开 DKH 时自动去 breezeblue.ai 点一次签到。签到接口只认网站登录态 Cookie，不认 API KEY，所以要单独填一次 Cookie（大约能用一两个月，过期了这里会提示）。',
+            '每天到点自动去 breezeblue.ai 点一次签到（默认 08:01，站点早八点开放）。软件整天开着也会准时签，过了点才打开会立刻补签一次。签到接口只认网站登录态 Cookie，不认 API KEY，所以要单独填一次 Cookie（大约能用一两个月，过期了这里会提示）。',
           ),
         ),
         h(
@@ -657,7 +671,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: css.col },
-            h('div', { style: css.title }, '打开 DKH 自动签到'),
+            h('div', { style: css.title }, '每天定时自动签到'),
             h('p', { style: css.hint }, `上次处理：${creditState.lastCheckInDate || '还没签过'}`),
           ),
           h('input', {
@@ -665,7 +679,29 @@ window.__ModuleLoader__.load({
             style: css.check,
             checked: autoCheckIn,
             onChange: (event) => setAutoCheckIn(Boolean(event.target.checked)),
-            'aria-label': '打开 DKH 自动签到',
+            'aria-label': '每天定时自动签到',
+          }),
+        ),
+        h(
+          'div',
+          { style: css.row },
+          h(
+            'div',
+            { style: css.col },
+            h('div', { style: css.title }, '每天几点签到'),
+            h(
+              'p',
+              { style: css.hint },
+              '服务端按分钟对表：到点签一次，电脑休眠醒来后也会立刻补上；失败 15 分钟内不重复打接口。',
+            ),
+          ),
+          h('input', {
+            type: 'time',
+            style: { ...css.input, minWidth: '0', width: '110px', opacity: autoCheckIn ? 1 : 0.5 },
+            value: checkInAt,
+            disabled: !autoCheckIn,
+            onChange: (event) => setCheckInAt(event.target.value || '08:01'),
+            'aria-label': '每天自动签到的时刻',
           }),
         ),
         h(

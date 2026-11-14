@@ -18,6 +18,10 @@ const QUEUE_TTL_MS = 120_000
 /** 同一条被某个页面取走后，多少毫秒内不再发给别的页面。 */
 const CLAIM_MS = 15_000
 const QUEUE_MAX = 12
+/** 提示音是内嵌的 base64（1 秒 wav），解码一次就缓存住。 */
+let chimeBuffer = null
+
+import { CHIME_BASE64, CHIME_MIME } from './chime.js'
 
 export const inject = ['tools', 'webServer']
 
@@ -153,6 +157,7 @@ export function apply(ctx, config) {
       volume: Number.isFinite(volume) ? Math.min(2, Math.max(0.01, volume)) : 0.9,
       audioTags: c.audioTags !== false,
       autoCheckIn: c.autoCheckIn !== false,
+      checkInAt: CHECK_IN_AT_RE.test(String(c.checkInAt ?? '')) ? String(c.checkInAt) : DEFAULT_CHECK_IN_AT,
       lastCheckInDate: typeof c.lastCheckInDate === 'string' ? c.lastCheckInDate : '',
     }
   }
@@ -278,6 +283,7 @@ export function apply(ctx, config) {
           name: 'voice_say',
           description:
             '每轮回复结束前调用一次：把这一轮真正做完/给出的结论压成一句话，用语音念出来（相当于语音播报）。'
+            + '**一轮只允许调用一次**：同一轮里第二次调用会被插件直接拒绝、不会再念第二遍，所以想清楚这一句再调，调完就去写正文。'
             + '只放结论，不要寒暄、不要复述全文；字数上限（设置页里那个数，默认 20）是给模型的写作要求，不是播报的截断线——'
             + '超过上限不会被截断，会整句照播并在结果里提醒你超了几字，所以请自己压到上限以内再调用。'
             + '中文里可以用方括号音频标签替代语气词，例如 [轻笑] [咯咯笑] [叹气] [耳语] [停顿] [咂嘴] [哼歌] [冷笑] [闷哼] [咳嗽] [打哈欠]；'
@@ -318,7 +324,7 @@ export function apply(ctx, config) {
               const note = v.overLimit > 0
                 ? `（超出建议字数 ${v.overLimit} 字，下次写短一点；这句照样完整播了）`
                 : ''
-              return [{ type: 'text', text: `语音已入队：${v.spoken}${note}` }]
+              return [{ type: 'text', text: `语音已入队：${v.spoken}${note}（本轮已播报，直接写正文收尾，不要再调用 voice_say）` }]
             },
           },
           async execute(args) {
@@ -329,12 +335,17 @@ export function apply(ctx, config) {
             if (raw.length > MAX_REQUEST_CHARS) {
               return { ok: false, queued: false, reason: `这句话太长了（${raw.length} 字符），请压到 ${c.maxChars} 字以内再调用` }
             }
+            // 同一轮只允许播一次：第二次直接拒绝，别再念一遍（也不进队列）。
+            if (turnKnown && spokenTurn === currentTurn) {
+              return { ok: false, queued: false, reason: `第 ${currentTurn} 轮已经播报过了，每轮只播一次，本轮别再调用` }
+            }
             const key = await resolveKey()
             if (!key) return { ok: false, queued: false, reason: '设置页里还没有填 Breeze API Key' }
             const direction = typeof args?.instructions === 'string' ? args.instructions.trim() : ''
             const visibleChars = visibleLength(raw)
             const overLimit = Math.max(0, visibleChars - Math.max(1, Number(c.maxChars) || 20))
             enqueue(raw, direction)
+            spokenTurn = currentTurn
             return { ok: true, queued: true, spoken: raw, visibleChars, overLimit }
           },
         },
@@ -347,6 +358,7 @@ export function apply(ctx, config) {
   // 所以照 dsh-meme 的做法，在 system-prompt/assemble 里追加一段固定规则。
   const VOICE_RULE =
     '语音播报规则：每轮回复结束前都要调用一次 voice_say，把这一轮的结论压成一句话念出来（相当于结束提示音）。'
+    + '**同一轮只调一次**：一轮里第二次调用会被直接拒绝、不会再念，所以先想好这句话再调，调完就写正文。'
     + '不论这一轮是干活、闲聊、报错，还是只回一句「在的」，在最终回复输出之前都必须调用一次，不能省略；'
     + '没有实质结论时就播一句简短收尾，例如「[轻笑] 在的，你说。」「[停顿] 那就先这样。」。'
     + '设置页里的字数上限是给模型写总结的要求，不是播报的截断线——超了照样整句播，只在结果里提示超了几字，所以请自己压到上限以内再调用。'
@@ -368,6 +380,27 @@ export function apply(ctx, config) {
     return assembled
   })
 
+  // 一轮只播一次。
+  // voice_say 的 execute 只拿得到 args，看不到现在是第几轮，所以用 agent/pre-step 记下当前轮号：
+  // 同一个 turn 里第二次调用直接拒绝，换轮后自动放开。
+  // （已知取舍：多会话并发时轮号会互相覆盖，最坏结果是某一轮的一句话没播出去——不会重复播。）
+  let currentTurn = 0
+  let spokenTurn = -1
+  let turnKnown = false
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    try {
+      const t = Number(payload && payload.turn)
+      if (Number.isFinite(t) && t >= 0) {
+        currentTurn = t
+        turnKnown = true
+      }
+    } catch {
+      // 记轮号失败不影响这一步
+    }
+    return decision
+  })
+
   // ------------------------------------------------------- daily credits
   //
   // 签到走网页端接口 `/api/credits/daily-claim`（不在 /v1 文档里）。
@@ -377,7 +410,15 @@ export function apply(ctx, config) {
   const WEB_BASE = 'https://breezeblue.ai'
   const COOKIE_REF = 'BREEZE_SITE_COOKIE'
 
+  // 站点每天按北京时间早八点开放签到，所以默认在 08:01 补一次。
+  // 启动检查只在「已经过点」时才签，没到点就交给每分钟的定时判定。
+  const DEFAULT_CHECK_IN_AT = '08:01'
+  const CHECK_IN_AT_RE = /^([01]\d|2[0-3]):([0-5]\d)$/
+  // 签到失败后至少隔这么久再试，避免站点没开放时每分钟打一次接口。
+  const CHECK_IN_RETRY_MS = 15 * 60_000
+
   let checkInState = { at: null, ok: null, note: '', text: '' }
+  let checkInAttemptAt = 0
 
   async function siteCookie() {
     const credentials = ctx.get('credentials')
@@ -408,10 +449,44 @@ export function apply(ctx, config) {
     return { status: response.status, text }
   }
 
-  const localDate = () => {
+  /** 'HH:mm' → 当天的分钟数。 */
+  const minutesOf = (hhmm) => {
+    const [h, m] = String(hhmm).split(':').map(Number)
+    return h * 60 + m
+  }
+
+  const nowMinutes = () => {
     const now = new Date()
+    return now.getHours() * 60 + now.getMinutes()
+  }
+
+  /**
+   * 「签到日」：站点按北京时间 08:00 换天（接口的 nextResetAt 是 UTC 00:00），
+   * 所以不能拿本地 0 点日期当判据 —— 凌晨 0–8 点签的那一次吃的是前一天的额度。
+   * 做法是把当前时刻往前推「签到时刻」那么多小时再取日期，写入与比较都用它。
+   */
+  const claimDate = () => {
+    const d = new Date(Date.now() - minutesOf(settings().checkInAt) * 60_000)
     const pad = (n) => String(n).padStart(2, '0')
-    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  }
+
+  /**
+   * 到点且今天还没签就签一次。用「每分钟对表」而不是一次性 setTimeout：
+   * 电脑休眠、改系统时间、软件开一整夜这几种情况下，醒来/到点的第一分钟就能补上。
+   */
+  const checkInTick = () => {
+    try {
+      const c = settings()
+      if (!c.autoCheckIn) return
+      if (c.lastCheckInDate === claimDate()) return
+      if (nowMinutes() < minutesOf(c.checkInAt)) return
+      if (Date.now() - checkInAttemptAt < CHECK_IN_RETRY_MS) return
+      checkInAttemptAt = Date.now()
+      void checkIn(false).catch(() => {})
+    } catch {
+      /* 单次异常忽略，下一分钟再看 */
+    }
   }
 
   /** 最近一次积分信息：设置页打开时直接读缓存，过期或手动刷新才打站点接口。 */
@@ -462,7 +537,7 @@ export function apply(ctx, config) {
   async function checkIn(force = false) {
     const c = settings()
     if (!c.autoCheckIn && !force) return { ok: true, skipped: '自动签到已关闭' }
-    const today = localDate()
+    const today = claimDate()
     if (!force && c.lastCheckInDate === today) return { ok: true, skipped: '今天已经签过了', date: today }
     let note = ''
     try {
@@ -602,8 +677,8 @@ export function apply(ctx, config) {
               })
             }
             const credits = await refreshCredits(false)
-            const today = localDate()
-            // 今天已经签过就是成功：即使上一次 POST 因网络抖动失败，也不该显示成失败。
+            const today = claimDate()
+            // 本签到周期已经签过就是成功：即使上一次 POST 因网络抖动失败，也不该显示成失败。
             const stateOut =
               c.lastCheckInDate === today
                 ? { at: checkInState.at, ok: true, note: '今天已经签过了', text: checkInState.text }
@@ -691,6 +766,25 @@ export function apply(ctx, config) {
         }),
       )
 
+      // 提示音：内嵌在这份代码里（chime.js 的 base64），前端播 TTS 之前先响它一下。
+      // 不读磁盘、不依赖任何外部路径，发布出去也能用。
+      disposers.push(
+        ctx.webServer.register({
+          kind: 'exact',
+          path: `${PREFIX}/chime`,
+          handler: async (req, res) => {
+            if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: '只支持 GET' })
+            if (!chimeBuffer) chimeBuffer = Buffer.from(CHIME_BASE64, 'base64')
+            res.writeHead(200, {
+              'content-type': CHIME_MIME,
+              'content-length': chimeBuffer.length,
+              'cache-control': 'public, max-age=86400',
+            })
+            res.end(chimeBuffer)
+          },
+        }),
+      )
+
       disposers.push(
         ctx.webServer.register({
           kind: 'exact',
@@ -731,6 +825,7 @@ export function apply(ctx, config) {
                 volume: c.volume,
                 audioTags: c.audioTags,
                 autoCheckIn: c.autoCheckIn,
+                checkInAt: c.checkInAt,
                 lastCheckInDate: c.lastCheckInDate,
                 siteCookie: { configured: Boolean(await siteCookie()) },
                 key: await keyStatus(),
@@ -767,6 +862,11 @@ export function apply(ctx, config) {
             }
             if (typeof body.audioTags === 'boolean') patch.audioTags = body.audioTags
             if (typeof body.autoCheckIn === 'boolean') patch.autoCheckIn = body.autoCheckIn
+            if (body.checkInAt !== undefined) {
+              const at = String(body.checkInAt).trim()
+              if (!CHECK_IN_AT_RE.test(at)) return sendJson(res, 400, { error: '签到时刻要写成 HH:mm（例如 08:01）' })
+              patch.checkInAt = at
+            }
             const credentials = ctx.get('credentials')
             const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
             const cookieInput = typeof body.siteCookie === 'string' ? body.siteCookie.trim() : ''
@@ -805,6 +905,7 @@ export function apply(ctx, config) {
               volume: next.volume ?? c.volume,
               audioTags: next.audioTags ?? c.audioTags,
               autoCheckIn: next.autoCheckIn ?? c.autoCheckIn,
+              checkInAt: next.checkInAt ?? c.checkInAt,
               lastCheckInDate: c.lastCheckInDate,
               siteCookie: { configured: Boolean(await siteCookie()) },
               key: await keyStatus(),
@@ -873,12 +974,13 @@ export function apply(ctx, config) {
       )
 
       const timer = setInterval(sweep, 20_000)
-      // 每次启动（= 每次打开 DKH）检查一次签到；当天已处理过就直接跳过。
-      const bootCheckIn = setTimeout(() => {
-        void checkIn(false).catch(() => {})
-      }, 4_000)
+      // 签到：每分钟对一次表（到点才签，整天开着也会签），启动 4 秒后再立刻判一次
+      // （打开 DKH 时已经过点就直接补签，没到点就安静等定时）。
+      const checkInTimer = setInterval(checkInTick, 60_000)
+      const bootCheckIn = setTimeout(checkInTick, 4_000)
       return () => {
         clearTimeout(bootCheckIn)
+        clearInterval(checkInTimer)
         clearInterval(timer)
         for (const dispose of disposers) {
           try {
